@@ -232,6 +232,10 @@ def parse_traj(traj_file):
     from ase.build import (  # type: ignore
         make_supercell,
     )
+    from ase.data import (  # type: ignore
+        atomic_numbers,
+        covalent_radii,
+    )
     from ase.io import (  # type: ignore
         read,
     )
@@ -265,6 +269,14 @@ def parse_traj(traj_file):
         "Br": 2.3,
         "H": 0.813,
     }
+
+    def safe_radius(symbol):
+        """Return the legacy radius or an ASE covalent-radius fallback."""
+        if symbol in safe_dist_dict:
+            return safe_dist_dict[symbol]
+        # The legacy table is expressed in Bohr before the 0.529 conversion
+        # below. Convert ASE's maintained Angstrom values to the same unit.
+        return covalent_radii[atomic_numbers[symbol]] / 0.529
 
     trajs: List[Atoms] = read(traj_file, index=":", format="traj")  # type: ignore
     dthresh = 0.72
@@ -308,7 +320,7 @@ def parse_traj(traj_file):
                 for b in range(a + 1, len(atype)):
                     dd = dist_dict[a][b]
                     dr = (
-                        (safe_dist_dict[atype[a]] + safe_dist_dict[atype[b]])
+                        (safe_radius(atype[a]) + safe_radius(atype[b]))
                         * 0.529
                         / 1.2
                     )

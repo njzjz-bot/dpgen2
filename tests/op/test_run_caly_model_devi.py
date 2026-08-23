@@ -271,6 +271,21 @@ ITEM: ATOMS id type x y z fx fy fz
         atoms_list_10 = parse_traj(self.traj_file_10)
         self.assertTrue(atoms_list_10 is None), self.atoms_abnormal
 
+    def test_parse_traj_supports_elements_outside_legacy_table(self):
+        """Use ASE covalent radii for common elements such as oxygen."""
+        oxygen_traj = self.work_dir / "oxygen.traj"
+        oxygen = Atoms(
+            symbols=["O", "O"],
+            scaled_positions=[[0, 0, 0], [0.5, 0.5, 0.5]],
+            cell=np.eye(3) * 10,
+        )
+        write(oxygen_traj, oxygen, format="traj")
+
+        selected = parse_traj(oxygen_traj)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(len(selected), 1)
+
     def test_01_atoms2lmpdump(self):
         dump_str = atoms2lmpdump(self.atoms_normal_2, 1, self.type_map)
         self.assertEqual(dump_str, self.ref_dump_str)
