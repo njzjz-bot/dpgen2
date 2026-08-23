@@ -4,8 +4,14 @@ import pickle
 import shutil
 import time
 import unittest
+from collections import (
+    defaultdict,
+)
 from pathlib import (
     Path,
+)
+from types import (
+    SimpleNamespace,
 )
 from typing import (
     List,
@@ -35,6 +41,10 @@ from dflow.python import (
     Artifact,
     OPIOSign,
     PythonOPTemplate,
+)
+from mock import (
+    Mock,
+    patch,
 )
 
 from dpgen2.constants import (
@@ -89,6 +99,7 @@ from dpgen2.superop.caly_evo_step import (
 )
 from dpgen2.superop.prep_run_calypso import (
     PrepRunCaly,
+    _prep_run_caly,
 )
 from dpgen2.utils.step_config import normalize as normalize_step_dict
 
@@ -99,6 +110,62 @@ prep_default_config = normalize_step_dict(
         },
     }
 )
+
+
+class TestPrepRunCalyConfiguration(unittest.TestCase):
+    def test_model_deviation_step_uses_run_config(self):
+        """Apply run-step controls to the sliced model-deviation step."""
+        step_calls = []
+
+        def make_mapping():
+            return defaultdict(Mock)
+
+        def make_step(name, *args, **kwargs):
+            step_calls.append((name, kwargs))
+            return SimpleNamespace(
+                outputs=SimpleNamespace(
+                    parameters=make_mapping(),
+                    artifacts=make_mapping(),
+                )
+            )
+
+        prep_run_steps = SimpleNamespace(
+            inputs=SimpleNamespace(
+                parameters=make_mapping(),
+                artifacts=make_mapping(),
+            ),
+            outputs=SimpleNamespace(artifacts=make_mapping()),
+            add=Mock(),
+        )
+        prep_config = normalize_step_dict({"continue_on_success_ratio": 0.1})
+        run_config = normalize_step_dict({"continue_on_success_ratio": 0.9})
+
+        with (
+            patch(
+                "dpgen2.superop.prep_run_calypso.Step",
+                side_effect=make_step,
+            ),
+            patch("dpgen2.superop.prep_run_calypso.PythonOPTemplate"),
+            patch("dpgen2.superop.prep_run_calypso.Slices"),
+            patch("dpgen2.superop.prep_run_calypso.argo_range"),
+            patch(
+                "dpgen2.superop.prep_run_calypso.init_executor",
+                side_effect=lambda value: value,
+            ),
+        ):
+            _prep_run_caly(
+                prep_run_steps,
+                defaultdict(str),
+                Mock(),
+                Mock(),
+                Mock(),
+                Mock(),
+                prep_config=prep_config,
+                run_config=run_config,
+            )
+
+        run_step_kwargs = dict(step_calls)["run-caly-model-devi"]
+        self.assertEqual(run_step_kwargs["continue_on_success_ratio"], 0.9)
 
 
 def make_task_group_list(njobs):
