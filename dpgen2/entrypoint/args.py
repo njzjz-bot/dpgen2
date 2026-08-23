@@ -808,7 +808,10 @@ def dpgen_step_config_args(default_config):
 
 
 def submit_args(default_step_config=normalize_step_dict({})):
-    doc_bohrium_config = "Configurations for the Bohrium platform."
+    doc_bohrium_config = (
+        "Configurations for the Bohrium platform. Omit this section or set it "
+        "to null when running locally with dflow debug mode."
+    )
     doc_step_configs = "Configurations for executing dflow steps"
     doc_upload_python_packages = "Upload python package, for debug purpose"
     doc_inputs = "The input parameter and artifacts for dpgen2"
