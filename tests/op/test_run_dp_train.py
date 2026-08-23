@@ -1047,6 +1047,47 @@ class TestRunDPTrainNullIterData(unittest.TestCase):
             jdata = json.load(fp)
             self.assertDictEqual(jdata, self.expected_odict_v2)
 
+    @patch("dpgen2.op.run_dp_train.run_command")
+    def test_exec_v2_fully_empty_training_systems(self, mocked_run):
+        """Propagate the initial model instead of launching an empty train."""
+        config = self.config.copy()
+        config["init_model_policy"] = "yes"
+
+        task_path = Path(self.task_path)
+        task_path.mkdir(exist_ok=True)
+        with open(task_path / train_script_name, "w") as fp:
+            json.dump(self.idict_v2, fp, indent=4)
+
+        empty_data = Path("foo")
+        empty_data.mkdir(exist_ok=True)
+        init_model = Path(self.init_model).absolute()
+        init_model.write_text("this is init model")
+        self.addCleanup(init_model.unlink, missing_ok=True)
+
+        out = RunDPTrain().execute(
+            OPIO(
+                {
+                    "config": config,
+                    "task_name": self.task_name,
+                    "task_path": task_path,
+                    "init_model": init_model,
+                    "init_data": [],
+                    "iter_data": [empty_data],
+                }
+            )
+        )
+
+        mocked_run.assert_not_called()
+        self.assertEqual(out["model"], init_model)
+        self.assertIn("no expanded training systems", out["log"].read_text())
+        with open(out["script"]) as fp:
+            train_dict = json.load(fp)
+        self.assertEqual(train_dict["training"]["training_data"]["systems"], [])
+        self.assertEqual(
+            train_dict["training"]["training_data"]["auto_prob"],
+            "prob_sys_size",
+        )
+
 
 class TestSplitValid(unittest.TestCase):
     def setUp(self):
