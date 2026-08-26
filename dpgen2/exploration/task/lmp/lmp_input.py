@@ -153,7 +153,9 @@ def make_lmp_input(
     else:
         sys = dpdata.System(conf_file, fmt="lammps/lmp")
         sys_data = sys.data
-        pka_mass = mass_map[sys_data["atom_types"][0] - 1]
+        # dpdata stores atom types as zero-based indices, while LAMMPS only
+        # converts them to one-based type IDs when writing the data file.
+        pka_mass = mass_map[sys_data["atom_types"][0]]
         pka_vn = (
             pka_e
             * pc.electron_volt
