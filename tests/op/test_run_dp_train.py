@@ -309,11 +309,113 @@ class TestRunDPTrain(unittest.TestCase):
 
     def test_decide_init_model_config_larger_than_yes(self):
         config = self.config.copy()
-        config["init_model_policy"] = f"old_data_larger_than:{self.old_data_size-1}"
+        config["init_model_policy"] = f"old_data_larger_than:{self.old_data_size - 1}"
         do_init_model = RunDPTrain.decide_init_model(
             config, self.init_model, self.init_data, self.iter_data
         )
         self.assertTrue(do_init_model)
+
+    def test_auto_prob_empty_new_iter_data(self):
+        """Test that auto_prob falls back to 'prob_sys_size' when
+        iter_data_new_exp is empty (e.g., FP produced no labeled data).
+
+        Previously this would generate "prob_sys_size; 0:2:0.6; 2:2:0.4"
+        which crashes dp train with "probabilities do not sum to 1".
+
+        This test exercises the real RunDPTrain.execute() code path with
+        a mocked run_command to verify the generated training script.
+        """
+        # Create an empty directory to simulate iter_data with no systems
+        empty_iter = Path("empty_iter_data")
+        empty_iter.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, empty_iter, ignore_errors=True)
+
+        # Create a task_path with input.json
+        task_path = Path("input-auto-prob-test")
+        task_path.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, task_path, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, Path("task-auto-prob"), ignore_errors=True)
+        with open(task_path / train_script_name, "w") as fp:
+            json.dump(self.idict_v2, fp, indent=4)
+
+        config = self.config.copy()
+        config["init_model_policy"] = "yes"
+        config["init_model_old_ratio"] = 0.6
+
+        ip = OPIO(
+            {
+                "config": config,
+                "task_name": "task-auto-prob",
+                "task_path": task_path,
+                "init_model": self.init_model,
+                "init_data": self.init_data,
+                "iter_data": [empty_iter],
+                "valid_data": None,
+                "optional_files": None,
+                "optional_parameter": {
+                    "mixed_type": False,
+                    "finetune_mode": "no",
+                },
+            }
+        )
+
+        op = RunDPTrain()
+        # Mock run_command so dp train is not actually invoked
+        with patch("dpgen2.op.run_dp_train.run_command", return_value=(0, "", "")):
+            op.execute(ip)
+
+        # Read the generated training script and verify auto_prob
+        script_path = Path("task-auto-prob") / train_script_name
+        self.assertTrue(script_path.exists(), "Training script was not generated")
+        with open(script_path) as fp:
+            train_dict = json.load(fp)
+        auto_prob = train_dict["training"]["training_data"]["auto_prob"]
+        # Must be plain "prob_sys_size", NOT "prob_sys_size; 0:2:0.6; 2:2:0.4"
+        self.assertEqual(auto_prob, "prob_sys_size")
+
+    def test_auto_prob_empty_old_data(self):
+        """The first labeled iteration falls back when no old data exists."""
+        task_path = Path("input-auto-prob-empty-old")
+        task_path.mkdir(exist_ok=True)
+        with open(task_path / train_script_name, "w") as fp:
+            json.dump(self.idict_v2, fp, indent=4)
+
+        config = self.config.copy()
+        config["init_model_policy"] = "yes"
+        config["init_model_old_ratio"] = 0.6
+        task_name = "task-auto-prob-empty-old"
+
+        ip = OPIO(
+            {
+                "config": config,
+                "task_name": task_name,
+                "task_path": task_path,
+                "init_model": self.init_model,
+                "init_data": [],
+                "iter_data": [self.iter_data[0]],
+                "valid_data": None,
+                "optional_files": None,
+                "optional_parameter": {
+                    "mixed_type": False,
+                    "finetune_mode": "no",
+                },
+            }
+        )
+
+        try:
+            op = RunDPTrain()
+            with patch("dpgen2.op.run_dp_train.run_command", return_value=(0, "", "")):
+                op.execute(ip)
+
+            script_path = Path(task_name) / train_script_name
+            self.assertTrue(script_path.exists(), "Training script was not generated")
+            with open(script_path) as fp:
+                train_dict = json.load(fp)
+            auto_prob = train_dict["training"]["training_data"]["auto_prob"]
+            self.assertEqual(auto_prob, "prob_sys_size")
+        finally:
+            shutil.rmtree(task_name, ignore_errors=True)
+            shutil.rmtree(task_path, ignore_errors=True)
 
     def test_update_input_dict_v1_init_model(self):
         odict = RunDPTrain.write_data_to_input_script(

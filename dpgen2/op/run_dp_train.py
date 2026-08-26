@@ -236,7 +236,23 @@ class RunDPTrain(OP):
                 len_init = len(init_data)
             numb_old = len_init + len(iter_data_old_exp)
             numb_new = numb_old + len(iter_data_new_exp)
-            auto_prob_str = f"prob_sys_size; 0:{numb_old}:{old_ratio}; {numb_old}:{numb_new}:{1.-old_ratio:g}"
+            if numb_old > 0 and numb_new > numb_old:
+                auto_prob_str = f"prob_sys_size; 0:{numb_old}:{old_ratio}; {numb_old}:{numb_new}:{1.0 - old_ratio:g}"
+            else:
+                # Both weighted ranges must be non-empty. Either the workflow has
+                # no old data yet, or the latest iteration produced no new data.
+                # Fall back to uniform prob_sys_size to avoid generating an
+                # empty range (e.g. "0:0:0.6" or "2:2:0.4") that crashes with
+                # "ValueError: probabilities do not sum to 1".
+                auto_prob_str = "prob_sys_size"
+                logging.warning(
+                    "Cannot build two non-empty auto_prob ranges "
+                    "(numb_old=%d, numb_new=%d). "
+                    "Falling back to auto_prob='prob_sys_size'. "
+                    "Training will proceed with all available data.",
+                    numb_old,
+                    numb_new,
+                )
 
         # update the input dict
         train_dict = RunDPTrain.write_data_to_input_script(
