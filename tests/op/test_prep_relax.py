@@ -64,8 +64,10 @@ class TestPrepRelax(unittest.TestCase):
         self.assertEqual(len(list(op_out["task_paths"][0].iterdir())), 1)
 
     def test_rejects_non_positive_group_size(self):
-        with self.assertRaisesRegex(ValueError, "greater than zero"):
-            self._run_prep_relax(1, 0)
+        for group_size in (0, -1):
+            with self.subTest(group_size=group_size):
+                with self.assertRaisesRegex(ValueError, "greater than zero"):
+                    self._run_prep_relax(1, group_size)
 
     def tearDown(self):
         for task_path in Path().glob("task.[0-9][0-9][0-9][0-9][0-9][0-9]"):
