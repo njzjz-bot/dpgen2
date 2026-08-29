@@ -1,3 +1,4 @@
+import logging
 from collections import (
     defaultdict,
 )
@@ -15,10 +16,14 @@ from dflow.python import (
     OPIO,
     Artifact,
     BigParameter,
+    FatalError,
     OPIOSign,
     Parameter,
 )
 
+from dpgen2.exploration.selector.distance_conf_filter import (
+    safe_dist_dict as full_safe_dist_dict,
+)
 from dpgen2.utils import (
     set_directory,
 )
@@ -232,10 +237,6 @@ def parse_traj(traj_file):
     from ase.build import (  # type: ignore
         make_supercell,
     )
-    from ase.data import (  # type: ignore
-        atomic_numbers,
-        covalent_radii,
-    )
     from ase.io import (  # type: ignore
         read,
     )
@@ -271,12 +272,13 @@ def parse_traj(traj_file):
     }
 
     def safe_radius(symbol):
-        """Return the legacy radius or an ASE covalent-radius fallback."""
+        """Return a CALYPSO safe radius, preferring legacy tuned values."""
         if symbol in safe_dist_dict:
             return safe_dist_dict[symbol]
-        # The legacy table is expressed in Bohr before the 0.529 conversion
-        # below. Convert ASE's maintained Angstrom values to the same unit.
-        return covalent_radii[atomic_numbers[symbol]] / 0.529
+        try:
+            return full_safe_dist_dict[symbol]
+        except KeyError:
+            raise FatalError(f"no safe distance known for element {symbol!r}") from None
 
     trajs: List[Atoms] = read(traj_file, index=":", format="traj")  # type: ignore
     dthresh = 0.72
@@ -319,11 +321,7 @@ def parse_traj(traj_file):
             for a in range(len(atype)):
                 for b in range(a + 1, len(atype)):
                     dd = dist_dict[a][b]
-                    dr = (
-                        (safe_radius(atype[a]) + safe_radius(atype[b]))
-                        * 0.529
-                        / 1.2
-                    )
+                    dr = (safe_radius(atype[a]) + safe_radius(atype[b])) * 0.529 / 1.2
                     if dd < dr:
                         frame_is_reasonable = False
 
@@ -332,6 +330,13 @@ def parse_traj(traj_file):
         selected_traj = [selected_traj[iii] for iii in i_keep]
     else:
         selected_traj = None
+
+    if selected_traj == []:
+        logging.warning(
+            "All frames in CALYPSO trajectory %s were rejected by "
+            "safe-distance filtering.",
+            traj_file,
+        )
 
     return selected_traj
 
