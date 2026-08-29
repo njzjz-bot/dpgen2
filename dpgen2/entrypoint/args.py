@@ -312,7 +312,7 @@ def caly_args():
             dict,
             run_expl_caly_conf_args(),
             optional=True,
-            default=RunLmp.normalize_config({}),
+            default={},
             doc=doc_config,
         ),
         Argument(
