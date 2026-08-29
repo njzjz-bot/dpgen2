@@ -207,13 +207,16 @@ class RunDPTrain(OP):
             valid_data = append_valid_data(config, valid_data, valid_systems)
         iter_data_exp = iter_data_old_exp + iter_data_new_exp
         if isinstance(init_data, dict):
-            has_init_training_data = any(
-                len(systems) > 0 for systems in init_data.values()
-            )
+            if config["multitask"]:
+                has_init_training_data = len(init_data.get(config["head"], [])) > 0
+            else:
+                has_init_training_data = any(
+                    len(systems) > 0 for systems in init_data.values()
+                )
         else:
             has_init_training_data = len(init_data) > 0
-        # A non-empty artifact list may still expand to zero DeePMD systems.
-        # Track the expanded state so an empty training command is never run.
+        # Initial data is expanded when the workflow is submitted, while a
+        # non-empty iteration artifact list may expand to zero systems here.
         training_systems_empty = not has_init_training_data and len(iter_data_exp) == 0
         work_dir = Path(task_name)
         init_model_with_finetune = config["init_model_with_finetune"]
@@ -236,11 +239,11 @@ class RunDPTrain(OP):
             mixed_type=mixed_type,
         )
         auto_prob_str = "prob_sys_size"
-        if do_init_model and not training_systems_empty:
+        if do_init_model:
             old_ratio = config["init_model_old_ratio"]
             if config["multitask"]:
                 head = config["head"]
-                len_init = len(init_data[head])
+                len_init = len(init_data.get(head, []))
             else:
                 len_init = len(init_data)
             numb_old = len_init + len(iter_data_old_exp)
