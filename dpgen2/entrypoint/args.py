@@ -20,6 +20,7 @@ from dpgen2.exploration.report import (
     conv_styles,
 )
 from dpgen2.exploration.selector import (
+    PlumedCVFilter,
     conf_filter_styles,
 )
 from dpgen2.fp import (
@@ -45,6 +46,7 @@ def make_link(content, ref_key):
 
 
 def dp_dist_train_args():
+    doc_numb_models = "Number of student models trained for model deviation"
     doc_config = "Configuration of training"
     doc_template_script = "File names of the template training script. It can be a `List[str]`, the length of which is the same as `numb_models`. Each template script in the list is used to train a model. Can be a `str`, the models share the same template training script. "
     dock_student_model_path = "The path of student model"
@@ -63,6 +65,7 @@ def dp_dist_train_args():
         Argument(
             "template_script", [List[str], str], optional=False, doc=doc_template_script
         ),
+        Argument("numb_models", int, optional=True, default=1, doc=doc_numb_models),
         Argument("student_model_path", str, optional=True, doc=dock_student_model_path),
         Argument(
             "student_model_uri",
@@ -86,11 +89,16 @@ def dp_train_args():
     doc_config = "Configuration of training"
     doc_template_script = "File names of the template training script. It can be a `List[str]`, the length of which is the same as `numb_models`. Each template script in the list is used to train a model. Can be a `str`, the models share the same template training script. "
     doc_init_models_paths = (
-        "Paths to initial models. When these models already represent the "
-        "initial dataset, DPGEN2 reuses them and skips training in iteration "
-        "zero because no iteration-generated data exists yet."
+        "Paths to initial models. Unless finetuning is requested, supplied models "
+        "are reused when there is no iteration-generated data or no expanded "
+        "training systems. Ensure the models are suitable for the initial dataset; "
+        "DPGEN2 does not check provenance. Subsequent training follows "
+        "init_model_policy (default: no, training from scratch)."
     )
-    doc_init_models_uri = "The URI of initial models"
+    doc_init_models_uri = (
+        "URI of initial models, taking precedence over init_models_paths. "
+        "The same training-skip and init_model_policy rules apply."
+    )
     doc_optional_files = "Optional files for training"
 
     return [
@@ -216,6 +224,15 @@ def lmp_args():
         "Each task group is described in :ref:`the task group definition<task_group_sec>` "
     )
     doc_filters = "A list of configuration filters"
+    doc_cv_filter = (
+        "Optional PLUMED CV candidate filter. A region may be a field-to-"
+        "[lower, upper] mapping or a named conditions mapping; regions are "
+        "combined by OR. Field names are exact PLUMED FIELDS labels and are "
+        "matched independently of column order. By default, one or two common "
+        "CVs are covered uniformly. Sampling also supports explicit random, "
+        "uniform, grid, or report modes, with optional frame spacing. Explicit "
+        "time alignment is required to bind COLVAR rows to trajectory frames."
+    )
 
     return [
         Argument(
@@ -262,6 +279,14 @@ def lmp_args():
             optional=True,
             default=[],
             doc=doc_filters,
+        ),
+        Argument(
+            "cv_filter",
+            dict,
+            PlumedCVFilter.args(),
+            optional=True,
+            default=None,
+            doc=doc_cv_filter,
         ),
     ]
 

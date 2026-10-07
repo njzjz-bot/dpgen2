@@ -11,6 +11,9 @@ from pathlib import (
 
 import dpdata
 import numpy as np
+from dargs.dargs import (
+    ArgumentError,
+)
 
 # isort: off
 from .context import (
@@ -126,6 +129,7 @@ class TestArgs(unittest.TestCase):
         # self.assertEqual(old_data['default_training_param'], new_data['train']['template_script'])
         self.assertEqual(new_data["train"]["template_script"], "dp_input_template")
         self.assertEqual(RunDPTrain.normalize_config({}), new_data["train"]["config"])
+        self.assertEqual(new_data["train"]["config"]["impl"], "tensorflow")
         self.assertEqual(
             RunLmp.normalize_config(old_data.get("lmp_config", {})),
             new_data["explore"]["config"],
@@ -154,6 +158,12 @@ class TestArgs(unittest.TestCase):
                 "storage_client": "dflow.plugins.bohrium.TiefblueClient",
             },
         )
+
+    def test_plm_output_file_path_is_rejected_at_submit(self):
+        data = json.loads(new_str)
+        data["explore"]["config"]["plm_output_file"] = "outputs/COLVAR"
+        with self.assertRaisesRegex(ArgumentError, "must be a file name"):
+            normalize(data)
 
 
 old_str = textwrap.dedent(

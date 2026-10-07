@@ -537,6 +537,39 @@ class TestRunDPTrain(unittest.TestCase):
             self.assertDictEqual(jdata, self.expected_odict_v1)
 
     @patch("dpgen2.op.run_dp_train.run_command")
+    def test_exec_pytorch_exportable(self, mocked_run):
+        mocked_run.return_value = (0, "foo\n", "")
+        config = self.config.copy()
+        config.update({"impl": "pt-expt", "init_model_policy": "no"})
+        Path(self.task_path).mkdir(exist_ok=True)
+        with open(Path(self.task_path) / train_script_name, "w") as fp:
+            json.dump(self.idict_v2, fp, indent=4)
+
+        out = RunDPTrain().execute(
+            OPIO(
+                {
+                    "config": config,
+                    "task_name": self.task_name,
+                    "task_path": Path(self.task_path),
+                    "init_model": Path(self.init_model),
+                    "init_data": [Path(ii) for ii in self.init_data],
+                    "iter_data": [Path(ii) for ii in self.iter_data],
+                }
+            )
+        )
+
+        self.assertEqual(out["model"], Path(self.task_name) / "model.ckpt.pt")
+        mocked_run.assert_called_once_with(
+            ["dp", "--pt-expt", "train", train_script_name]
+        )
+        self.assertEqual(
+            out["log"].read_text(),
+            "#=================== train std out ===================\n"
+            "foo\n"
+            "#=================== train std err ===================\n",
+        )
+
+    @patch("dpgen2.op.run_dp_train.run_command")
     def test_exec_v2(self, mocked_run):
         mocked_run.side_effect = [(0, "foo\n", ""), (0, "bar\n", "")]
 
@@ -947,6 +980,8 @@ class TestRunDPTrainNullIterData(unittest.TestCase):
 
     @patch("dpgen2.op.run_dp_train.run_command")
     def test_exec_v2_empty_list(self, mocked_run):
+        mocked_run.side_effect = [(0, "foo\n", ""), (0, "bar\n", "")]
+
         config = self.config.copy()
         config["init_model_policy"] = "no"
 
@@ -973,6 +1008,7 @@ class TestRunDPTrainNullIterData(unittest.TestCase):
                 }
             )
         )
+        mocked_run.assert_not_called()
         self.assertEqual(out["script"], work_dir / train_script_name)
         self.assertEqual(out["model"], self.init_model)
         self.assertEqual(out["lcurve"], work_dir / "lcurve.out")
@@ -990,7 +1026,6 @@ class TestRunDPTrainNullIterData(unittest.TestCase):
             jdata = json.load(fp)
             self.assertDictEqual(jdata, self.expected_odict_v2)
         self.assertEqual(Path(out["model"]).read_text(), "this is init model")
-        mocked_run.assert_not_called()
 
         os.remove(self.init_model)
 
@@ -1048,6 +1083,118 @@ class TestRunDPTrainNullIterData(unittest.TestCase):
         with open(out["script"]) as fp:
             jdata = json.load(fp)
             self.assertDictEqual(jdata, self.expected_odict_v2)
+
+    @patch("dpgen2.op.run_dp_train.run_command")
+    def test_exec_v2_fully_empty_training_systems(self, mocked_run):
+        """Propagate the initial model instead of launching an empty train."""
+        mocked_run.side_effect = [(0, "foo\n", ""), (0, "bar\n", "")]
+
+        config = self.config.copy()
+        config["init_model_policy"] = "yes"
+
+        task_path = Path(self.task_path)
+        task_path.mkdir(exist_ok=True)
+        with open(task_path / train_script_name, "w") as fp:
+            json.dump(self.idict_v2, fp, indent=4)
+
+        empty_data = Path("foo")
+        empty_data.mkdir(exist_ok=True)
+        init_model = Path(self.init_model).absolute()
+        init_model.write_text("this is init model")
+        self.addCleanup(init_model.unlink, missing_ok=True)
+
+        out = RunDPTrain().execute(
+            OPIO(
+                {
+                    "config": config,
+                    "task_name": self.task_name,
+                    "task_path": task_path,
+                    "init_model": init_model,
+                    "init_data": [],
+                    "iter_data": [empty_data],
+                }
+            )
+        )
+
+        mocked_run.assert_not_called()
+        self.assertEqual(out["model"], init_model)
+        self.assertIn("no expanded training systems", out["log"].read_text())
+        with open(out["script"]) as fp:
+            train_dict = json.load(fp)
+        self.assertEqual(train_dict["training"]["training_data"]["systems"], [])
+        self.assertEqual(
+            train_dict["training"]["training_data"]["auto_prob"],
+            "prob_sys_size",
+        )
+
+    @patch("dpgen2.op.run_dp_train.run_command")
+    def test_exec_v2_empty_active_multitask_head(self, mocked_run):
+        """Ignore pretrained data belonging only to inactive heads."""
+        mocked_run.side_effect = [(0, "foo\n", ""), (0, "bar\n", "")]
+
+        config = self.config.copy()
+        config.update(
+            {
+                "init_model_policy": "yes",
+                "multitask": True,
+                "head": "A",
+            }
+        )
+        multitask_script = {
+            "training": {
+                "data_dict": {
+                    "A": {"training_data": {"systems": []}},
+                    "B": {"training_data": {"systems": []}},
+                }
+            },
+            "learning_rate": {"start_lr": 1.0},
+            "loss_dict": {
+                head: {
+                    "start_pref_e": 1.0,
+                    "start_pref_f": 1.0,
+                    "start_pref_v": 1.0,
+                }
+                for head in ("A", "B")
+            },
+        }
+
+        task_path = Path(self.task_path)
+        task_path.mkdir(exist_ok=True)
+        with open(task_path / train_script_name, "w") as fp:
+            json.dump(multitask_script, fp, indent=4)
+
+        empty_data = Path("foo")
+        empty_data.mkdir(exist_ok=True)
+        init_model = Path(self.init_model).absolute()
+        init_model.write_text("this is init model")
+        self.addCleanup(init_model.unlink, missing_ok=True)
+
+        out = RunDPTrain().execute(
+            OPIO(
+                {
+                    "config": config,
+                    "task_name": self.task_name,
+                    "task_path": task_path,
+                    "init_model": init_model,
+                    # Head A intentionally has no entry; only inactive head B
+                    # carries pretrained data.
+                    "init_data": {"B": [self.init_data[0]]},
+                    "iter_data": [empty_data],
+                }
+            )
+        )
+
+        mocked_run.assert_not_called()
+        self.assertEqual(out["model"], init_model)
+        self.assertIn("no expanded training systems", out["log"].read_text())
+        with open(out["script"]) as fp:
+            train_dict = json.load(fp)
+        data_dict = train_dict["training"]["data_dict"]
+        self.assertEqual(data_dict["A"]["training_data"]["systems"], [])
+        self.assertEqual(
+            data_dict["B"]["training_data"]["systems"],
+            [str(self.init_data[0])],
+        )
 
 
 class TestSplitValid(unittest.TestCase):
