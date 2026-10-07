@@ -33,7 +33,9 @@ from dpgen2.exploration.task.calypso import (
 
 class TestMakeLmpTaskGroupFromConfig(unittest.TestCase):
     def setUp(self):
-        self.extra_file = Path("SiC_ZBL.txt")
+        self.extra_dir = Path("extra_tables")
+        self.extra_dir.mkdir()
+        self.extra_file = self.extra_dir / "SiC_ZBL.txt"
         self.extra_file.write_text("ZBL table content\n")
         self.config_npt = {
             "type": "lmp-md",
@@ -54,6 +56,7 @@ class TestMakeLmpTaskGroupFromConfig(unittest.TestCase):
     def tearDown(self):
         os.remove(self.config_template["lmp_template_fname"])
         self.extra_file.unlink()
+        self.extra_dir.rmdir()
 
     def test_npt(self):
         tgroup = make_lmp_task_group_from_config(
@@ -65,23 +68,35 @@ class TestMakeLmpTaskGroupFromConfig(unittest.TestCase):
         config = {
             **self.config_npt,
             "input_extra_files": [str(self.extra_file)],
+            "Ts": [100, 200],
         }
         tgroup = make_lmp_task_group_from_config(
             self.numb_models, self.mass_map, config
         )
-        tgroup.set_conf(["LAMMPS configuration"])
+        tgroup.set_conf(["LAMMPS configuration 1", "LAMMPS configuration 2"])
         tgroup.make_task()
 
-        self.assertEqual(
-            tgroup[0].files()[self.extra_file.name],
-            "ZBL table content\n",
-        )
+        self.assertEqual(len(tgroup), 4)
+        for task in tgroup:
+            self.assertEqual(task.files()[self.extra_file.name], "ZBL table content\n")
+            self.assertNotIn(str(self.extra_file), task.files())
 
     def test_template(self):
         tgroup = make_lmp_task_group_from_config(
             self.numb_models, self.mass_map, self.config_template
         )
         self.assertTrue(isinstance(tgroup, LmpTemplateTaskGroup))
+        self.assertFalse(tgroup.strict_revisions)
+
+    def test_template_strict_revisions(self):
+        strict_config = {
+            **self.config_template,
+            "strict_revisions": True,
+        }
+        tgroup = make_lmp_task_group_from_config(
+            self.numb_models, self.mass_map, strict_config
+        )
+        self.assertTrue(tgroup.strict_revisions)
 
 
 class TestMakeCalyTaskGroupFromConfig(unittest.TestCase):
