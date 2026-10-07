@@ -563,6 +563,7 @@ def config_strip_confidx(
 
 
 def make_calypso_task_group_from_config(config):
+    config = config.copy()
     config.pop("type", None)
     config = caly_normalize(config)
 
@@ -633,10 +634,11 @@ def make_lmp_task_group_from_config(
     mass_map,
     config,
 ):
-    # Work around the required conf_idx.
-    # May not be a good design!!!
+    # Configuration selection is handled by the caller, outside this helper.
+    # Supply the required normalization key only if neither spelling is present.
     config = config.copy()
-    config.setdefault("conf_idx", [])
+    if "conf_idx" not in config and "sys_idx" not in config:
+        config["conf_idx"] = []
     config = lmp_normalize(config)
     config = config_strip_confidx(config)
     if config["type"] == "lmp-md":
