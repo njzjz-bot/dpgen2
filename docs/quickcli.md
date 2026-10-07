@@ -47,7 +47,7 @@ The `download` command retrieves training, exploration, and labeling artifacts w
 dpgen2 download input.json WFID --list-supported
 ```
 
-Running without filters downloads every supported artifact from every successful iteration. Use iteration and artifact filters for a smaller result set:
+Running without filters downloads every supported artifact from every successful step, including succeeded steps in an otherwise failed iteration. Use iteration and artifact filters for a smaller result set:
 
 ```bash
 dpgen2 download input.json WFID \
@@ -62,11 +62,13 @@ dpgen2 download input.json WFID \
   --prefix results
 ```
 
-Files are organized below `results/iter-000000/<step>/<input-or-output>/<artifact>`. Existing completed downloads are skipped by default; pass `--no-check-point` to request them again. The corresponding result groups are:
+The range `0-2` is half-open: it selects iterations 0 and 1, excluding 2. To include iteration 2, use `0-3`.
 
-- training: models, learning curves, logs, and generated scripts;
-- exploration: trajectories, model deviations, logs, and extra outputs;
-- labeling: input configurations, labeled data, logs, and extra outputs.
+Files are organized below `results/iter-000000/<step>/<input-or-output>/<artifact>`. Existing completed downloads are skipped by default; pass `--no-check-point` to request them again. This done-marker checkpoint is separate from dflow's `skip_exists` behavior mentioned above.
+
+With `-k/--keys`, downloads instead use `<prefix>/iter-000000/<step>/inputs` and `<prefix>/iter-000000/<step>/outputs`, merging each step's artifacts into those directories without per-artifact leaves.
+
+The supported step groups are `prep-run-train` (training), `prep-run-explore` (exploration), `prep-run-fp` (labeling), and `collect-data` (accumulated training data). Use `--list-supported` for the authoritative list of input and output artifacts available for each group in your installed version.
 
 
 ## Show the keys of steps
