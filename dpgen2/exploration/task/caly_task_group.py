@@ -73,7 +73,7 @@ covalent_radii = [
 ]  # fmt: skip
 
 
-def _choose_distinct_species(name_of_atoms):
+def _choose_distinct_species(name_of_atoms: List[List[str]]) -> List[str]:
     """Pick one distinct species per candidate list with randomized matching.
 
     Each augmenting path visits a candidate at most once. Unlike rejection
@@ -83,9 +83,9 @@ def _choose_distinct_species(name_of_atoms):
     candidates = [list(dict.fromkeys(atoms)) for atoms in name_of_atoms]
     for atoms in candidates:
         random.shuffle(atoms)
-    assigned = {}
+    assigned: dict[str, int] = {}
 
-    def augment(slot, visited):
+    def augment(slot: int, visited: set[str]) -> bool:
         for atom in candidates[slot]:
             if atom in visited:
                 continue
@@ -102,10 +102,8 @@ def _choose_distinct_species(name_of_atoms):
                 f"name_of_atoms={name_of_atoms!r}: some group of sub-lists "
                 "has fewer candidates than sub-lists"
             )
-    choice = [None] * len(candidates)
-    for atom, slot in assigned.items():
-        choice[slot] = atom
-    return choice
+    choice = {slot: atom for atom, slot in assigned.items()}
+    return [choice[slot] for slot in range(len(candidates))]
 
 
 class CalyTaskGroup(ExplorationTaskGroup):
