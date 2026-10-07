@@ -9,6 +9,9 @@ import unittest
 from pathlib import (
     Path,
 )
+from unittest.mock import (
+    patch,
+)
 
 import dpdata
 import numpy as np
@@ -183,6 +186,7 @@ class TestFileConfGenerator(unittest.TestCase):
             "fmt": "auto",
             "prefix": None,
             "remove_pbc": False,
+            "remove_spins": False,
         }
         out_data = FileConfGenerator.normalize_config(
             in_data,
@@ -199,6 +203,7 @@ class TestFileConfGenerator(unittest.TestCase):
             "fmt": "bar",
             "prefix": None,
             "remove_pbc": False,
+            "remove_spins": False,
         }
         out_data = FileConfGenerator.normalize_config(
             in_data,
@@ -228,19 +233,78 @@ class TestFileConfGenerator(unittest.TestCase):
 
 
 class TestFileConfGeneratorContent(unittest.TestCase):
-    def test_abacus_spin_metadata_is_not_written_to_atomic_lammps_data(self):
-        stru = Path("STRU")
-        stru.write_text(abacus_stru)
-        self.addCleanup(stru.unlink, missing_ok=True)
+    @unittest.skipIf(
+        _dpdata_ver < (0, 2, 22), "dpdata does not load/export ABACUS spins"
+    )
+    def test_abacus_spin_metadata_is_removed_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stru = Path(tmp) / "STRU"
+            stru.write_text(abacus_stru)
+            source = dpdata.System(stru, fmt="abacus/stru", type_map=["Si"])
+            self.assertIn("spins", source.data)
+            generator = FileConfGenerator(
+                str(stru), fmt="abacus/stru", remove_spins=True
+            )
+            with self.assertLogs(level="WARNING") as logs:
+                loaded = generator.generate(["Si"])[0]
+            self.assertIn("remove_spins", logs.output[0])
+            self.assertNotIn("spins", loaded.data)
+            for key in ["coords", "cells", "atom_types"]:
+                np.testing.assert_allclose(loaded[key], source[key])
 
-        content = FileConfGenerator(str(stru), fmt="abacus/stru").get_file_content(
-            type_map=["Si"]
-        )[0]
-        atom_section = content.split("Atoms # atomic", maxsplit=1)[1]
-        atom_line = next(line for line in atom_section.splitlines() if line.strip())
+            for fmt in ["lammps/lmp", "lmp", "LAMMPS/LMP", "Lmp", "LMP", "lammps/LMP"]:
+                with self.subTest(fmt=fmt), self.assertLogs(level="WARNING"):
+                    content = generator.get_file_content(type_map=["Si"], fmt=fmt)[0]
+                    output = Path(tmp) / "conf.lmp"
+                    output.write_text(content)
+                    roundtrip = dpdata.System(output, fmt="lammps/lmp", type_map=["Si"])
+                    self.assertNotIn("spins", roundtrip.data)
+                    for key in ["coords", "cells", "atom_types"]:
+                        np.testing.assert_allclose(roundtrip[key], source[key])
+            self.assertEqual(stru.read_text(), abacus_stru)
+            np.testing.assert_array_equal(
+                dpdata.System(stru, fmt="abacus/stru")["spins"], source["spins"]
+            )
 
-        # Atomic style accepts only ID, type, and xyz coordinates.
-        self.assertEqual(len(atom_line.split()), 5)
+    @unittest.skipIf(
+        _dpdata_ver < (0, 2, 22), "dpdata does not load/export ABACUS spins"
+    )
+    def test_abacus_spins_are_preserved_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stru = Path(tmp) / "STRU"
+            stru.write_text(abacus_stru.replace("mag 0.0", "mag 2.0"))
+            for options in [{}, {"remove_spins": False}]:
+                with self.subTest(options=options):
+                    generator = FileConfGenerator(
+                        str(stru), fmt="abacus/stru", **options
+                    )
+                    source = generator.generate(["Si"])[0]
+                    self.assertIn("spins", source.data)
+                    expected = Path(tmp) / "expected.lmp"
+                    source[0].to("lammps/lmp", expected)
+                    self.assertEqual(
+                        generator.get_file_content(["Si"])[0], expected.read_text()
+                    )
+                    self.assertIn("spins", generator.generate(["Si"])[0].data)
+
+    def test_remove_spins_applies_to_every_mixed_system(self):
+        systems = dpdata.MultiSystems(type_map=["Al", "Mg"])
+        for poscar in [pos0, pos1]:
+            with tempfile.NamedTemporaryFile(mode="w+") as stream:
+                stream.write(poscar)
+                stream.flush()
+                system = dpdata.System(stream.name, fmt="vasp/poscar")
+                system.data["spins"] = np.ones_like(system["coords"])
+                systems.append(system)
+        with patch.object(FileConfGenerator, "generate_mixed", return_value=systems):
+            with self.assertLogs(level="WARNING") as logs:
+                loaded = FileConfGenerator(
+                    "unused", fmt="deepmd/npy/mixed", remove_spins=True
+                ).generate(["Al", "Mg"])
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(len(logs.output), 2)
+        for system in loaded:
+            self.assertNotIn("spins", system.data)
 
     def test_list_1(self):
         f0 = Path("f0.POSCAR")
