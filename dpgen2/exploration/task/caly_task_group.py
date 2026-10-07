@@ -73,6 +73,41 @@ covalent_radii = [
 ]  # fmt: skip
 
 
+def _choose_distinct_species(name_of_atoms):
+    """Pick one distinct species per candidate list with randomized matching.
+
+    Each augmenting path visits a candidate at most once. Unlike rejection
+    sampling, this terminates for both satisfiable and impossible inputs.
+    Candidate order is shuffled without modifying the caller's lists.
+    """
+    candidates = [list(dict.fromkeys(atoms)) for atoms in name_of_atoms]
+    for atoms in candidates:
+        random.shuffle(atoms)
+    assigned = {}
+
+    def augment(slot, visited):
+        for atom in candidates[slot]:
+            if atom in visited:
+                continue
+            visited.add(atom)
+            if atom not in assigned or augment(assigned[atom], visited):
+                assigned[atom] = slot
+                return True
+        return False
+
+    for slot in range(len(candidates)):
+        if not augment(slot, set()):
+            raise ValueError(
+                f"cannot pick {len(candidates)} distinct species from "
+                f"name_of_atoms={name_of_atoms!r}: some group of sub-lists "
+                "has fewer candidates than sub-lists"
+            )
+    choice = [None] * len(candidates)
+    for atom, slot in assigned.items():
+        choice[slot] = atom
+    return choice
+
+
 class CalyTaskGroup(ExplorationTaskGroup):
     def __init__(self):
         super().__init__()
@@ -118,28 +153,7 @@ class CalyTaskGroup(ExplorationTaskGroup):
         if isinstance(name_of_atoms, list) and all(
             [isinstance(i, list) for i in name_of_atoms]
         ):
-            overlap = set(name_of_atoms[0])
-            for temp in name_of_atoms[1:]:
-                overlap = overlap & set(temp)
-
-            if any(not (set(atom_choices) - overlap) for atom_choices in name_of_atoms):
-                raise ValueError(
-                    f"Any sub-list should not equal with intersection, e.g. [[A,B,C], [B,C], [C]] is not allowed."
-                )
-
-            while True:
-                choice = []
-                for _atoms in name_of_atoms:
-                    value = random.choice(_atoms)
-                    logging.info(
-                        f"randomly choose {value} from {_atoms}, already choose: {choice}"
-                    )
-                    if value in choice:
-                        break
-                    choice.append(value)
-                else:
-                    break
-            self.name_of_atoms = choice
+            self.name_of_atoms = _choose_distinct_species(name_of_atoms)
             logging.info(f"The final choice is {self.name_of_atoms}")
             self.atomic_number = [atomic_symbols.index(i) for i in self.name_of_atoms]
         else:
