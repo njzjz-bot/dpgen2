@@ -21,6 +21,9 @@ from dargs import (
     Variant,
     dargs,
 )
+from dargs.dargs import (
+    ArgumentError,
+)
 from dflow.python import (
     OP,
     OPIO,
@@ -41,6 +44,7 @@ from dpgen2.constants import (
     model_name_match_pattern,
     model_name_pattern,
     plm_output_name,
+    pt2_model_name_pattern,
     pytorch_model_name_pattern,
 )
 from dpgen2.utils import (
@@ -50,6 +54,34 @@ from dpgen2.utils import (
 from dpgen2.utils.run_command import (
     run_command,
 )
+
+_MODEL_BACKEND_ALIASES = {"pt-expt": "pytorch-exportable"}
+_MODEL_BACKEND_FLAGS = {
+    "pytorch": "--pt",
+    "pytorch-exportable": "--pt-expt",
+}
+
+
+class PrepareDPModels(OP):
+    """Freeze DP checkpoints once before exploration tasks are fanned out."""
+
+    @classmethod
+    def get_input_sign(cls):
+        return OPIOSign(
+            {
+                "config": BigParameter(dict),
+                "models": Artifact(List[Path]),
+            }
+        )
+
+    @classmethod
+    def get_output_sign(cls):
+        return OPIOSign({"models": Artifact(List[Path])})
+
+    @OP.exec_sign_check
+    def execute(self, ip: OPIO) -> OPIO:
+        config = RunLmp.normalize_config(ip["config"] or {})
+        return OPIO({"models": prepare_dp_models(ip["models"], config)})
 
 
 class RunLmp(OP):
@@ -109,8 +141,8 @@ class RunLmp(OP):
         Any
             Output dict with components:
             - `log`: (`Artifact(Path)`) The log file of LAMMPS.
-            - `traj`: (`Artifact(Path)`) The output trajectory.
-            - `model_devi`: (`Artifact(Path)`) The model deviation. The order of recorded model deviations should be consistent with the order of frames in `traj`.
+            - `traj`: (`Artifact(Path)` or `Artifact(HDF5Datasets)`) The output trajectory. The HDF5 backend returns a one-element list containing the trajectory path for dflow serialization.
+            - `model_devi`: (`Artifact(Path)` or `Artifact(HDF5Datasets)`) The model deviation. The HDF5 backend returns a one-element list containing the numeric array. The order of recorded model deviations should be consistent with the order of frames in `traj`.
 
         Raises
         ------
@@ -118,29 +150,61 @@ class RunLmp(OP):
             On the failure of LAMMPS execution. Handle different failure cases? e.g. loss atoms.
         """
         config = ip["config"] if ip["config"] is not None else {}
-        config = RunLmp.normalize_config(config)
+        try:
+            config = RunLmp.normalize_config(config)
+        except ArgumentError as exc:
+            raise FatalError(f"invalid LAMMPS configuration: {exc}") from exc
         command = config["command"]
         teacher_model: Optional[BinaryFileInput] = config["teacher_model_path"]
         shuffle_models: Optional[bool] = config["shuffle_models"]
+        plm_output_file = config["plm_output_file"]
         task_name = ip["task_name"]
         task_path = ip["task_path"]
         models = ip["models"]
         # input_files = [lmp_conf_name, lmp_input_name]
         # input_files = [(Path(task_path) / ii).resolve() for ii in input_files]
         input_files = [ii.resolve() for ii in Path(task_path).iterdir()]
+        if plm_output_file in {ii.name for ii in input_files}:
+            raise FatalError(
+                f"PLUMED output file {plm_output_file!r} collides with a staged "
+                "LAMMPS input file"
+            )
         model_files = [Path(ii).resolve() for ii in models]
         work_dir = Path(task_name)
 
         if teacher_model is not None:
-            assert (
-                len(model_files) == 1
-            ), "One model is enough in knowledge distillation"
             ext = os.path.splitext(teacher_model.file_name)[-1]
             teacher_model_file = "teacher_model" + ext
             teacher_model.save_as_file(teacher_model_file)
             model_files = [Path(teacher_model_file).resolve()] + model_files
 
+        generated_names = {
+            lmp_log_name,
+            lmp_model_devi_name,
+            lmp_traj_name,
+            plm_output_name,
+            "job.json",
+        }
+        for idx in range(len(model_files)):
+            generated_names.add(model_name_pattern % idx)
+            generated_names.add(pytorch_model_name_pattern % idx)
+        if plm_output_file in generated_names:
+            raise FatalError(
+                f"PLUMED output file {plm_output_file!r} collides with a generated "
+                "LAMMPS, PLUMED, or model file"
+            )
+
         with set_directory(work_dir):
+            # Remove a pre-existing output before creating any task links. This
+            # prevents stale CV data from surviving a retried task.
+            plm_output_path = Path(plm_output_file)
+            if plm_output_path.is_file() or plm_output_path.is_symlink():
+                plm_output_path.unlink()
+            elif plm_output_path.exists():
+                raise FatalError(
+                    f"PLUMED output path {plm_output_file!r} is not a file"
+                )
+
             # link input files
             for ii in input_files:
                 iname = ii.name
@@ -152,10 +216,26 @@ class RunLmp(OP):
                 if ext == ".pb":
                     mname = model_name_pattern % (idx)
                     Path(mname).symlink_to(mm)
+                elif ext == ".pth":
+                    mname = pytorch_model_name_pattern % (idx)
+                    Path(mname).symlink_to(mm)
+                elif ext == ".pt2":
+                    mname = pt2_model_name_pattern % (idx)
+                    Path(mname).symlink_to(mm)
                 elif ext == ".pt":
                     # freeze model
-                    mname = pytorch_model_name_pattern % (idx)
-                    freeze_model(mm, mname, config.get("model_frozen_head"))
+                    backend = _model_backend(config)
+                    mname = _model_name(idx, config["model_format"])
+                    freeze_model(
+                        mm,
+                        mname,
+                        config.get("model_frozen_head"),
+                        backend,
+                    )
+                    if config["dp_compress"]:
+                        compressed = _compressed_model_name(idx, config["model_format"])
+                        compress_model(mname, compressed, backend)
+                        mname = compressed
                 else:
                     raise RuntimeError(
                         "Model file with extension '%s' is not supported" % ext
@@ -163,9 +243,16 @@ class RunLmp(OP):
                 model_names.append(mname)
 
             if shuffle_models:
-                random.shuffle(model_names)
+                if teacher_model is None:
+                    random.shuffle(model_names)
+                else:
+                    student_model_names = model_names[1:]
+                    random.shuffle(student_model_names)
+                    model_names[1:] = student_model_names
 
             set_models(lmp_input_name, model_names)
+            if any(Path(name).suffix == ".pt2" for name in model_names):
+                ensure_pt2_atom_map(lmp_input_name)
 
             # run lmp
             command = " ".join([command, "-i", lmp_input_name, "-log", lmp_log_name])
@@ -206,8 +293,8 @@ class RunLmp(OP):
             "model_devi": self.get_model_devi(work_dir / lmp_model_devi_name),
         }
         plm_output = (
-            {"plm_output": work_dir / plm_output_name}
-            if (work_dir / plm_output_name).is_file()
+            {"plm_output": work_dir / plm_output_file}
+            if (work_dir / plm_output_file).is_file()
             else {}
         )
         ret_dict.update(plm_output)
@@ -235,7 +322,16 @@ class RunLmp(OP):
         doc_head = "Select a head from multitask"
         doc_use_ele_temp = "Whether to use electronic temperature, 0 for no, 1 for frame temperature, and 2 for atomic temperature"
         doc_use_hdf5 = "Use HDF5 to store trajs and model_devis"
+        doc_plm_output_file = (
+            "PLUMED CV output artifact to collect. It must match the FILE used "
+            "by PLUMED PRINT and defaults to COLVAR."
+        )
         doc_extra_output_files = "Extra output file names, support wildcards"
+        doc_model_devi_backend = (
+            "The DeePMD backend used to freeze models for exploration"
+        )
+        doc_model_format = "The frozen model format. Use 'pt2' for DPA4 and DPA4C"
+        doc_dp_compress = "Compress the frozen model before exploration"
         return [
             Argument("command", str, optional=True, default="lmp", doc=doc_lmp_cmd),
             Argument(
@@ -267,11 +363,42 @@ class RunLmp(OP):
                 doc=doc_use_hdf5,
             ),
             Argument(
+                "plm_output_file",
+                str,
+                optional=True,
+                default="COLVAR",
+                extra_check=lambda value: value not in {"", ".", ".."}
+                and Path(value).name == value,
+                extra_check_errmsg="must be a file name, not a path",
+                doc=doc_plm_output_file,
+            ),
+            Argument(
                 "extra_output_files",
                 list,
                 optional=True,
                 default=[],
                 doc=doc_extra_output_files,
+            ),
+            Argument(
+                "model_devi_backend",
+                str,
+                optional=True,
+                default="pytorch",
+                doc=doc_model_devi_backend,
+            ),
+            Argument(
+                "model_format",
+                str,
+                optional=True,
+                default="pth",
+                doc=doc_model_format,
+            ),
+            Argument(
+                "dp_compress",
+                bool,
+                optional=True,
+                default=False,
+                doc=doc_dp_compress,
             ),
         ]
 
@@ -310,7 +437,7 @@ def set_models(lmp_input_name: str, model_names: List[str]):
                 break
     if match_first == -1:
         raise RuntimeError(
-            f"cannot file model pattern {pattern} in line " f" {lmp_input_lines[idx]}"
+            f"cannot file model pattern {pattern} in line  {lmp_input_lines[idx]}"
         )
     if match_last == -1:
         raise RuntimeError(f"last matching index should not be -1, terribly wrong ")
@@ -323,6 +450,81 @@ def set_models(lmp_input_name: str, model_names: List[str]):
     new_line_split[match_first:match_last] = model_names
     lmp_input_lines[idx] = " ".join(new_line_split) + "\n"
 
+    with open(lmp_input_name, "w", encoding="utf8") as f:
+        f.write("".join(lmp_input_lines))
+
+
+def ensure_pt2_atom_map(lmp_input_name: str):
+    """Ensure a PT2 LAMMPS input enables the atom map before creating a box.
+
+    Parameters
+    ----------
+    lmp_input_name : str
+        Path to the LAMMPS input file.
+
+    Raises
+    ------
+    RuntimeError
+        If an existing atom-map command follows the first box-creation command
+        in a clear-delimited section, or no box-creation command is present.
+    """
+    with open(lmp_input_name, encoding="utf8") as f:
+        lmp_input_lines = f.readlines()
+
+    commands = []
+    command_start = 0
+    command_parts = []
+    for index, line in enumerate(lmp_input_lines):
+        code = line.partition("#")[0].rstrip()
+        command_parts.append(code[:-1] if code.endswith("&") else code)
+        if code.endswith("&"):
+            continue
+        commands.append((command_start, " ".join(command_parts)))
+        command_start = index + 1
+        command_parts = []
+    if command_parts:
+        commands.append((command_start, " ".join(command_parts)))
+
+    sections = [[]]
+    for command in commands:
+        if re.match(r"^\s*clear(?:\s|$)", command[1]):
+            sections.append([])
+        else:
+            sections[-1].append(command)
+
+    insert_indices = []
+    found_box_command = False
+    for section in sections:
+        boundary_positions = [
+            position
+            for position, (_, command) in enumerate(section)
+            if re.search(r"\b(?:create_box|read_data|read_restart)\b", command)
+        ]
+        if not boundary_positions:
+            continue
+        found_box_command = True
+        first_boundary = boundary_positions[0]
+        map_positions = [
+            position
+            for position, (_, command) in enumerate(section)
+            if re.match(r"^\s*atom_modify\b.*\bmap\s+(?:yes|array|hash)\b", command)
+        ]
+        if any(position < first_boundary for position in map_positions):
+            continue
+        if map_positions:
+            raise RuntimeError(
+                "PT2 LAMMPS inputs require atom_modify map before "
+                "create_box, read_data, or read_restart"
+            )
+        insert_indices.append(section[first_boundary][0])
+
+    if not found_box_command:
+        raise RuntimeError(
+            "PT2 LAMMPS inputs require create_box, read_data, or read_restart"
+        )
+
+    for index in reversed(insert_indices):
+        lmp_input_lines.insert(index, "atom_modify        map yes\n")
     with open(lmp_input_name, "w", encoding="utf8") as f:
         f.write("".join(lmp_input_lines))
 
@@ -366,29 +568,142 @@ def get_ele_temp(lmp_log_name):
     return None
 
 
-def freeze_model(input_model, frozen_model, head=None):
-    freeze_args = "-o %s" % frozen_model
+def _model_backend(config):
+    backend = _MODEL_BACKEND_ALIASES.get(
+        config["model_devi_backend"], config["model_devi_backend"]
+    )
+    model_format = config["model_format"]
+    if backend not in _MODEL_BACKEND_FLAGS:
+        raise RuntimeError(f"Unsupported model-deviation backend '{backend}'")
+    if model_format not in ["pth", "pt2"]:
+        raise RuntimeError(f"Unsupported model format '{model_format}'")
+    if model_format == "pth" and backend != "pytorch":
+        raise RuntimeError("The pth model format requires the pytorch backend")
+    if config["dp_compress"] and not (
+        backend == "pytorch-exportable" and model_format == "pt2"
+    ):
+        raise RuntimeError(
+            "Compressed pt2 models require the pytorch-exportable backend"
+        )
+    return backend
+
+
+def validate_model_backend(train_backend, config):
+    """Validate that a PyTorch checkpoint is frozen by its training backend.
+
+    Parameters
+    ----------
+    train_backend : str
+        DeePMD training backend.
+    config : dict
+        LAMMPS exploration configuration.
+
+    Raises
+    ------
+    RuntimeError
+        If PyTorch training and deployment backends differ.
+    """
+    train_backend = _MODEL_BACKEND_ALIASES.get(train_backend, train_backend)
+    if train_backend not in _MODEL_BACKEND_FLAGS:
+        return
+    model_backend = _model_backend(RunLmp.normalize_config(config))
+    if model_backend != train_backend:
+        raise RuntimeError(
+            f"The model-deviation backend '{model_backend}' cannot freeze a "
+            f"checkpoint trained by '{train_backend}'; use the same backend "
+            "for training and model deployment"
+        )
+
+
+def _model_name(index, model_format):
+    if model_format == "pt2":
+        return pt2_model_name_pattern % index
+    return pytorch_model_name_pattern % index
+
+
+def _compressed_model_name(index, model_format):
+    return "model.%03d.compressed.%s" % (index, model_format)
+
+
+def prepare_dp_models(models, config):
+    """Return frozen models, exporting checkpoints once when needed."""
+    prepared = []
+    output_dir = Path("prepared_models")
+    for idx, model in enumerate(models):
+        model = Path(model).resolve()
+        ext = model.suffix
+        if ext != ".pt":
+            if ext not in [".pb", ".pth", ".pt2"]:
+                raise RuntimeError(
+                    "Model file with extension '%s' is not supported" % ext
+                )
+            prepared.append(model)
+            continue
+        backend = _model_backend(config)
+        output_dir.mkdir(exist_ok=True)
+        frozen_model = output_dir / _model_name(idx, config["model_format"])
+        freeze_model(
+            model,
+            frozen_model,
+            config.get("model_frozen_head"),
+            backend,
+        )
+        if config["dp_compress"]:
+            compressed_model = output_dir / _compressed_model_name(
+                idx, config["model_format"]
+            )
+            compress_model(frozen_model, compressed_model, backend)
+            frozen_model = compressed_model
+        prepared.append(frozen_model)
+    return prepared
+
+
+def freeze_model(input_model, frozen_model, head=None, backend="pytorch"):
+    backend = _MODEL_BACKEND_ALIASES.get(backend, backend)
+    freeze_cmd = [
+        "dp",
+        _MODEL_BACKEND_FLAGS[backend],
+        "freeze",
+        "-c",
+        str(input_model),
+        "-o",
+        str(frozen_model),
+    ]
     if head is not None:
-        freeze_args += " --head %s" % head
-    freeze_cmd = "dp --pt freeze -c %s %s" % (input_model, freeze_args)
-    ret, out, err = run_command(freeze_cmd, shell=True)
+        freeze_cmd.extend(["--head", str(head)])
+    if backend == "pytorch-exportable" and Path(frozen_model).suffix == ".pt2":
+        freeze_cmd.extend(["--lower-kind", "graph"])
+    ret, out, err = run_command(freeze_cmd)
     if ret != 0:
         logging.error(
-            "".join(
-                (
-                    "freeze failed\n",
-                    "command was",
-                    freeze_cmd,
-                    "out msg",
-                    out,
-                    "\n",
-                    "err msg",
-                    err,
-                    "\n",
-                )
-            )
+            "freeze failed\ncommand was %s\nout msg%s\nerr msg%s\n",
+            freeze_cmd,
+            out,
+            err,
         )
-        raise TransientError("freeze failed")
+        raise FatalError("freeze failed")
+
+
+def compress_model(input_model, output_model, backend="pytorch-exportable"):
+    backend = _MODEL_BACKEND_ALIASES.get(backend, backend)
+    compress_cmd = [
+        "dp",
+        _MODEL_BACKEND_FLAGS[backend],
+        "compress",
+        "-i",
+        str(input_model),
+        "-o",
+        str(output_model),
+    ]
+    ret, out, err = run_command(compress_cmd)
+    if ret != 0:
+        logging.error(
+            "compress failed\ncommand was%s\nout msg%s\nerr msg%s\n",
+            compress_cmd,
+            out,
+            err,
+        )
+        raise FatalError("compress failed")
 
 
 def merge_pimd_files():
@@ -415,8 +730,9 @@ class RunLmpHDF5(RunLmp):
         return output_sign
 
     def get_model_devi(self, model_devi_file):
-        return np.loadtxt(model_devi_file)
+        """Return a list so dflow serializes the model-deviation dataset."""
+        return [np.loadtxt(model_devi_file)]
 
     def get_traj(self, traj_file):
-        """Return trajectory text for serialization into an HDF5 dataset."""
-        return traj_file.read_text()
+        """Return a list of paths for dflow's HDF5 file serialization."""
+        return [traj_file]

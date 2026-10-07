@@ -5,15 +5,28 @@ import unittest
 from pathlib import (
     Path,
 )
+from tempfile import (
+    TemporaryDirectory,
+)
 
 import dpdata
+import h5py
 import numpy as np
+from dargs.dargs import (
+    ArgumentError,
+)
 from dflow.python import (
     OP,
     OPIO,
     Artifact,
+    FatalError,
+    HDF5Datasets,
     OPIOSign,
     TransientError,
+)
+from dflow.python.utils import (
+    handle_input_artifact,
+    handle_output_artifact,
 )
 from mock import (
     call,
@@ -32,13 +45,27 @@ from dpgen2.constants import (
     lmp_model_devi_name,
     lmp_traj_name,
     model_name_pattern,
+    pt2_model_name_pattern,
+)
+from dpgen2.exploration.render import (
+    TrajRenderLammps,
+)
+from dpgen2.exploration.deviation import (
+    DeviManager,
 )
 from dpgen2.op.run_lmp import (
+    PrepareDPModels,
     RunLmp,
     RunLmpHDF5,
+    _model_backend,
+    compress_model,
+    ensure_pt2_atom_map,
+    freeze_model,
     get_ele_temp,
     merge_pimd_files,
+    prepare_dp_models,
     set_models,
+    validate_model_backend,
 )
 from dpgen2.utils import (
     BinaryFileInput,
@@ -67,6 +94,112 @@ class TestRunLmp(unittest.TestCase):
             shutil.rmtree("models")
         if Path(self.task_name).is_dir():
             shutil.rmtree(self.task_name)
+
+    def test_plm_output_file_config(self):
+        self.assertEqual(RunLmp.normalize_config({})["plm_output_file"], "COLVAR")
+        config = RunLmp.normalize_config({"plm_output_file": "COLVAR"})
+        self.assertEqual(config["plm_output_file"], "COLVAR")
+        with self.assertRaises(ArgumentError):
+            RunLmp.normalize_config({"plm_output_file": "outputs/COLVAR"})
+        for invalid_name in ["", ".", ".."]:
+            with self.subTest(invalid_name=invalid_name), self.assertRaises(
+                ArgumentError
+            ):
+                RunLmp.normalize_config({"plm_output_file": invalid_name})
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_plm_output_file_invalid_config_is_fatal(self, mocked_run):
+        with self.assertRaisesRegex(FatalError, "invalid LAMMPS configuration"):
+            RunLmp().execute(
+                OPIO(
+                    {
+                        "config": {"plm_output_file": "outputs/COLVAR"},
+                        "task_name": self.task_name,
+                        "task_path": self.task_path,
+                        "models": self.models,
+                    }
+                )
+            )
+        mocked_run.assert_not_called()
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_plm_output_file_collection(self, mocked_run):
+        def run_with_plumed_output(*args, **kwargs):
+            Path("PLUMED_OUT").write_text("#! FIELDS time cv\n0.0 0.5\n")
+            return 0, "", ""
+
+        mocked_run.side_effect = run_with_plumed_output
+        out = RunLmp().execute(
+            OPIO(
+                {
+                    "config": {"plm_output_file": "PLUMED_OUT"},
+                    "task_name": self.task_name,
+                    "task_path": self.task_path,
+                    "models": self.models,
+                }
+            )
+        )
+        self.assertEqual(out["plm_output"], Path(self.task_name) / "PLUMED_OUT")
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_plm_output_file_rejects_staged_input(self, mocked_run):
+        (self.task_path / "COLVAR").write_text("stale input")
+        with self.assertRaisesRegex(FatalError, "collides with a staged"):
+            RunLmp().execute(
+                OPIO(
+                    {
+                        "config": {"plm_output_file": "COLVAR"},
+                        "task_name": self.task_name,
+                        "task_path": self.task_path,
+                        "models": self.models,
+                    }
+                )
+            )
+        mocked_run.assert_not_called()
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_plm_output_file_does_not_reuse_stale_output(self, mocked_run):
+        Path(self.task_name).mkdir()
+        stale_output = Path(self.task_name) / "COLVAR"
+        stale_output.write_text("stale output")
+
+        def run_without_stale_output(*args, **kwargs):
+            self.assertFalse(Path("COLVAR").exists())
+            return 0, "", ""
+
+        mocked_run.side_effect = run_without_stale_output
+
+        out = RunLmp().execute(
+            OPIO(
+                {
+                    "config": {"plm_output_file": "COLVAR"},
+                    "task_name": self.task_name,
+                    "task_path": self.task_path,
+                    "models": self.models,
+                }
+            )
+        )
+
+        self.assertIsNone(out["plm_output"])
+        self.assertFalse(stale_output.exists())
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_plm_output_file_rejects_generated_name(self, mocked_run):
+        for output_name in ["output.plumed", model_name_pattern % 0, lmp_log_name]:
+            with self.subTest(output_name=output_name), self.assertRaisesRegex(
+                FatalError, "collides with a generated"
+            ):
+                RunLmp().execute(
+                    OPIO(
+                        {
+                            "config": {"plm_output_file": output_name},
+                            "task_name": self.task_name,
+                            "task_path": self.task_path,
+                            "models": self.models,
+                        }
+                    )
+                )
+        mocked_run.assert_not_called()
 
     @patch("dpgen2.op.run_lmp.run_command")
     def test_success(self, mocked_run):
@@ -102,6 +235,40 @@ class TestRunLmp(unittest.TestCase):
             self.assertEqual(
                 (work_dir / (model_name_pattern % ii)).read_text(), f"model{ii}"
             )
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_pt2_enables_atom_map_before_read(self, mocked_run):
+        mocked_run.return_value = (0, "", "")
+        (self.task_path / lmp_input_name).write_text(
+            "atom_style atomic\n"
+            'if "${restart} > 0" then "read_restart dpgen.restart.*" '
+            'else "read_data conf.lmp"\n'
+            "pair_style deepmd model.000.pb model.001.pb out_freq 10\n"
+        )
+        models = [self.model_path / f"model_{index}.pt2" for index in range(2)]
+        for model in models:
+            model.write_text("model")
+
+        def copy_link(source, target, target_is_directory=False):
+            shutil.copyfile(source, target)
+
+        with patch("os.symlink", side_effect=copy_link):
+            RunLmp().execute(
+                OPIO(
+                    {
+                        "config": {"command": "mylmp"},
+                        "task_name": self.task_name,
+                        "task_path": self.task_path,
+                        "models": models,
+                    }
+                )
+            )
+
+        lmp_input = (Path(self.task_name) / lmp_input_name).read_text()
+        atom_map = "atom_modify        map yes"
+        self.assertEqual(lmp_input.count(atom_map), 1)
+        self.assertLess(lmp_input.index(atom_map), lmp_input.index("read_restart"))
+        self.assertLess(lmp_input.index(atom_map), lmp_input.index("read_data"))
 
     @patch("dpgen2.op.run_lmp.run_command")
     def test_error(self, mocked_run):
@@ -150,30 +317,132 @@ class TestRunLmp(unittest.TestCase):
             "Hello -i in.lammps -log log.lammps",
         )
 
-    @patch("dpgen2.op.run_lmp.run_command")
-    def test_hdf5_outputs_dataset_values(self, mocked_run):
-        """Return serializable data instead of filesystem paths for HDF5."""
 
-        def write_outputs(*args, **kwargs):
-            Path(lmp_traj_name).write_text("trajectory data")
-            np.savetxt(lmp_model_devi_name, np.arange(7).reshape(1, 7))
-            return 0, "foo\n", ""
+class TestRunLmpHDF5(unittest.TestCase):
+    trajectory = """ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 10
+0 10
+ITEM: ATOMS id type x y z
+1 1 1 2 3
+"""
 
-        mocked_run.side_effect = write_outputs
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.task_path = self.root / "input"
+        self.task_path.mkdir()
+        (self.task_path / lmp_conf_name).write_text("foo")
+        (self.task_path / lmp_input_name).write_text("bar")
+        self.model = self.root / "model.pb"
+        self.model.write_text("model")
+        # dflow may write output path-list parameters alongside the artifacts.
+        (self.root / "outputs/parameters").mkdir(parents=True)
 
-        out = RunLmpHDF5().execute(
+    def run_task(self, task_name):
+        return RunLmpHDF5().execute(
             OPIO(
                 {
                     "config": {"command": "mylmp"},
-                    "task_name": self.task_name,
+                    "task_name": str(self.root / task_name),
                     "task_path": self.task_path,
-                    "models": self.models,
+                    "models": [self.model],
                 }
             )
         )
 
-        self.assertEqual(out["traj"], "trajectory data")
-        np.testing.assert_array_equal(out["model_devi"], np.arange(7))
+    def read_artifact(self, name):
+        datasets = handle_input_artifact(
+            name,
+            Artifact(HDF5Datasets),
+            path=str(self.root / "outputs/artifacts" / name),
+        )
+        for dataset in datasets:
+            self.addCleanup(dataset.file.close)
+        return datasets
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_round_trip_two_tasks(self, mocked_run):
+        """Exercise real dflow serialization and downstream rendering."""
+        expected_deviations = [np.arange(7), np.arange(7) + 10]
+
+        def write_outputs(*args, **kwargs):
+            task_index = int(Path.cwd().name[-1])
+            Path(lmp_traj_name).write_text(self.trajectory)
+            np.savetxt(lmp_model_devi_name, expected_deviations[task_index][None, :])
+            return 0, "foo\n", ""
+
+        mocked_run.side_effect = write_outputs
+        output_sign = RunLmpHDF5.get_output_sign()
+        # Write in reverse order to exercise dflow's task-slice ordering too.
+        for index in (1, 0):
+            out = self.run_task(f"task_{index}")
+            for name in ("traj", "model_devi"):
+                handle_output_artifact(
+                    name,
+                    out[name],
+                    output_sign[name],
+                    slices=index,
+                    data_root=str(self.root),
+                )
+        for name in ("traj", "model_devi"):
+            files = list((self.root / "outputs/artifacts" / name).glob("*.h5"))
+            self.assertEqual(len(files), 2)
+            for filename in files:
+                with h5py.File(filename, "r") as h5:
+                    self.assertEqual(list(h5.keys()), ["0"])
+                    if name == "traj":
+                        self.assertEqual(h5["0"].attrs["type"], "file")
+                        self.assertEqual(h5["0"].attrs["dtype"], "utf-8")
+                        self.assertTrue(h5["0"].attrs["path"].endswith(lmp_traj_name))
+
+        trajs = self.read_artifact("traj")
+        model_devis = self.read_artifact("model_devi")
+        self.assertEqual(len(trajs), 2)
+        self.assertEqual(len(model_devis), 2)
+        for index in range(2):
+            self.assertEqual(trajs[index].get_data(), self.trajectory)
+            np.testing.assert_array_equal(
+                model_devis[index].get_data(), expected_deviations[index]
+            )
+        renderer = TrajRenderLammps()
+        deviations = renderer.get_model_devi(model_devis)
+        self.assertEqual(deviations.ntraj, 2)
+        np.testing.assert_array_equal(
+            deviations.get(DeviManager.MAX_DEVI_F), [[4], [14]]
+        )
+        confs = renderer.get_confs(trajs, [[0], [0]], type_map=["H"])
+        self.assertEqual(confs.get_nframes(), 2)
+
+    def test_preserves_binary_and_missing_file_handling(self):
+        """Leave file decoding and absent-file guards to dflow."""
+        path = self.root / lmp_traj_name
+        for content in (None, b"\xff\xfe\x00"):
+            with self.subTest(content=content):
+                if content is not None:
+                    path.write_bytes(content)
+                out = RunLmpHDF5().get_traj(path)
+                self.assertEqual(out, [path])
+                name = "missing" if content is None else "binary"
+                handle_output_artifact(
+                    name,
+                    out,
+                    Artifact(HDF5Datasets),
+                    slices=0,
+                    data_root=str(self.root),
+                )
+                datasets = self.read_artifact(name)
+                if content is None:
+                    self.assertEqual(len(datasets), 0)
+                else:
+                    self.assertEqual(len(datasets), 1)
+                    self.assertEqual(datasets[0].get_data(), content)
+                    self.assertEqual(datasets[0].dataset.attrs["dtype"], "binary")
 
 
 class TestRunLmpDist(unittest.TestCase):
@@ -277,11 +546,158 @@ run             3000 upto
         # The number of models have to be 2 in knowledge distillation
         self.assertEqual(len(list((work_dir.glob("*.pb")))), 2)
 
+    @patch("dpgen2.op.run_lmp.random.shuffle")
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_multiple_students_with_teacher(self, mocked_run, mocked_shuffle):
+        mocked_run.return_value = (0, "foo\n", "")
+        mocked_shuffle.side_effect = lambda models: models.reverse()
+        second_model = self.model_path / "model_1.pb"
+        second_model.write_text("model1")
+
+        RunLmp().execute(
+            OPIO(
+                {
+                    "config": {
+                        "command": "mylmp",
+                        "shuffle_models": True,
+                        "teacher_model_path": self.teacher_model,
+                    },
+                    "task_name": self.task_name,
+                    "task_path": self.task_path,
+                    "models": [*self.models, second_model],
+                }
+            )
+        )
+
+        work_dir = Path(self.task_name)
+        lmp_input = (work_dir / lmp_input_name).read_text()
+        self.assertIn(
+            "pair_style deepmd model.000.pb model.002.pb model.001.pb", lmp_input
+        )
+        self.assertEqual((work_dir / "model.000.pb").read_text(), "teacher model")
+        self.assertEqual((work_dir / "model.001.pb").read_text(), "model0")
+        self.assertEqual((work_dir / "model.002.pb").read_text(), "model1")
+
 
 def swap_element(arg):
     bk = arg.copy()
     arg[1] = bk[0]
     arg[0] = bk[1]
+
+
+class TestPrepareDPModels(unittest.TestCase):
+    def setUp(self):
+        self.model_dir = Path("checkpoint_models")
+        self.model_dir.mkdir()
+        self.models = []
+        for idx in range(2):
+            model = self.model_dir / f"model.{idx}.pt"
+            model.write_text("checkpoint")
+            self.models.append(model)
+
+    def tearDown(self):
+        shutil.rmtree(self.model_dir, ignore_errors=True)
+        shutil.rmtree("prepared_models", ignore_errors=True)
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_dpa4_pt2(self, mocked_run):
+        mocked_run.return_value = (0, "", "")
+        models = PrepareDPModels().execute(
+            OPIO(
+                {
+                    "config": {
+                        "model_devi_backend": "pytorch",
+                        "model_format": "pt2",
+                    },
+                    "models": self.models,
+                }
+            )
+        )["models"]
+        self.assertEqual(
+            models,
+            [
+                Path("prepared_models/model.000.pt2"),
+                Path("prepared_models/model.001.pt2"),
+            ],
+        )
+        mocked_run.assert_has_calls(
+            [
+                call(
+                    [
+                        "dp",
+                        "--pt",
+                        "freeze",
+                        "-c",
+                        str(model.resolve()),
+                        "-o",
+                        str(Path("prepared_models") / f"model.{idx:03d}.pt2"),
+                    ]
+                )
+                for idx, model in enumerate(self.models)
+            ]
+        )
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_dpa4c_compressed_pt2(self, mocked_run):
+        mocked_run.return_value = (0, "", "")
+        models = PrepareDPModels().execute(
+            OPIO(
+                {
+                    "config": {
+                        "model_devi_backend": "pt-expt",
+                        "model_format": "pt2",
+                        "dp_compress": True,
+                    },
+                    "models": self.models[:1],
+                }
+            )
+        )["models"]
+        self.assertEqual(models, [Path("prepared_models/model.000.compressed.pt2")])
+        mocked_run.assert_has_calls(
+            [
+                call(
+                    [
+                        "dp",
+                        "--pt-expt",
+                        "freeze",
+                        "-c",
+                        str(self.models[0].resolve()),
+                        "-o",
+                        str(Path("prepared_models/model.000.pt2")),
+                        "--lower-kind",
+                        "graph",
+                    ]
+                ),
+                call(
+                    [
+                        "dp",
+                        "--pt-expt",
+                        "compress",
+                        "-i",
+                        str(Path("prepared_models/model.000.pt2")),
+                        "-o",
+                        str(Path("prepared_models/model.000.compressed.pt2")),
+                    ]
+                ),
+            ]
+        )
+
+    def test_training_and_deployment_backends_must_match(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot freeze a checkpoint"):
+            validate_model_backend(
+                "pytorch",
+                {
+                    "model_devi_backend": "pytorch-exportable",
+                    "model_format": "pt2",
+                },
+            )
+        validate_model_backend(
+            "pt-expt",
+            {
+                "model_devi_backend": "pytorch-exportable",
+                "model_format": "pt2",
+            },
+        )
 
 
 class TestSetModels(unittest.TestCase):
@@ -299,6 +715,16 @@ class TestSetModels(unittest.TestCase):
         input_name.write_text(lmp_config)
         set_models(input_name, self.model_names)
         self.assertEqual(input_name.read_text(), expected_output)
+
+    def test_pt2(self):
+        lmp_config = "pair_style deepmd model.000.pb model.001.pb out_freq 10\n"
+        expected_output = "pair_style deepmd model.000.pt2 model.001.pt2 out_freq 10\n"
+        self.input_name.write_text(lmp_config)
+        set_models(
+            self.input_name,
+            [pt2_model_name_pattern % 0, pt2_model_name_pattern % 1],
+        )
+        self.assertEqual(self.input_name.read_text(), expected_output)
 
     def test_failed(self):
         lmp_config = "pair_style      deepmd model.000.pb model.001.pb out_freq 10 out_file model_devi.out model.002.pb\n"
@@ -398,3 +824,165 @@ ITEM: ATOMS id type x y z
         ]:
             if os.path.exists(f):
                 os.remove(f)
+
+
+class TestPrepareDPModelsPassthrough(unittest.TestCase):
+    def setUp(self):
+        self.model_dir = Path("_test_models")
+        self.model_dir.mkdir(exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.model_dir, ignore_errors=True)
+        shutil.rmtree("prepared_models", ignore_errors=True)
+
+    def test_pth_passthrough(self):
+        model = self.model_dir / "model.000.pth"
+        model.write_text("frozen")
+        config = RunLmp.normalize_config(
+            {"model_devi_backend": "tensorflow", "model_format": "pth"}
+        )
+        result = prepare_dp_models([model], config)
+        self.assertEqual(result, [model.resolve()])
+
+    def test_pt2_passthrough(self):
+        model = self.model_dir / "model.000.pt2"
+        model.write_text("frozen")
+        config = RunLmp.normalize_config(
+            {"model_devi_backend": "tensorflow", "model_format": "pt2"}
+        )
+        result = prepare_dp_models([model], config)
+        self.assertEqual(result, [model.resolve()])
+
+    def test_pb_passthrough(self):
+        model = self.model_dir / "graph.000.pb"
+        model.write_text("frozen")
+        config = RunLmp.normalize_config({"model_devi_backend": "tensorflow"})
+        result = prepare_dp_models([model], config)
+        self.assertEqual(result, [model.resolve()])
+
+    def test_unsupported_extension_raises(self):
+        model = self.model_dir / "model.onnx"
+        model.write_text("bad")
+        config = RunLmp.normalize_config(
+            {"model_devi_backend": "pytorch", "model_format": "pt2"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "not supported"):
+            prepare_dp_models([model], config)
+
+
+class TestModelBackendValidation(unittest.TestCase):
+    def test_unsupported_backend(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "Unsupported model-deviation backend"
+        ):
+            _model_backend(
+                {
+                    "model_devi_backend": "bogus",
+                    "model_format": "pt2",
+                    "dp_compress": False,
+                }
+            )
+
+    def test_unsupported_format(self):
+        with self.assertRaisesRegex(RuntimeError, "Unsupported model format"):
+            _model_backend(
+                {
+                    "model_devi_backend": "pytorch",
+                    "model_format": "xyz",
+                    "dp_compress": False,
+                }
+            )
+
+    def test_pth_requires_pytorch(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "pth model format requires the pytorch"
+        ):
+            _model_backend(
+                {
+                    "model_devi_backend": "pytorch-exportable",
+                    "model_format": "pth",
+                    "dp_compress": False,
+                }
+            )
+
+    def test_compress_requires_exportable_pt2(self):
+        with self.assertRaisesRegex(RuntimeError, "Compressed pt2"):
+            _model_backend(
+                {
+                    "model_devi_backend": "pytorch",
+                    "model_format": "pt2",
+                    "dp_compress": True,
+                }
+            )
+
+    def test_validate_non_pytorch_backend_skips(self):
+        validate_model_backend(
+            "tensorflow", {"model_devi_backend": "pytorch", "model_format": "pt2"}
+        )
+
+
+class TestEnsurePt2AtomMap(unittest.TestCase):
+    def setUp(self):
+        self.input_path = Path("test_input.lammps")
+
+    def tearDown(self):
+        self.input_path.unlink(missing_ok=True)
+
+    def transform(self, lines):
+        self.input_path.write_text(lines)
+        ensure_pt2_atom_map(str(self.input_path))
+        return self.input_path.read_text()
+
+    def test_map_already_present_before_read(self):
+        result = self.transform("atom_modify map yes\nread_data conf.lmp\n")
+        self.assertIn("atom_modify map yes", result)
+        self.assertEqual(result.count("atom_modify"), 1)
+
+    def test_map_inserted_before_continued_command(self):
+        lines = (
+            'if "${restart} > 0" then &\n'
+            '    "read_restart dpgen.restart.*" &\n'
+            "else &\n"
+            '    "read_data conf.lmp"\n'
+        )
+        result = self.transform(lines)
+        self.assertTrue(result.startswith("atom_modify        map yes\nif "))
+
+    def test_map_reinserted_after_clear(self):
+        result = self.transform("read_data first.lmp\nclear\nread_data second.lmp\n")
+        self.assertEqual(result.count("atom_modify        map yes"), 2)
+        self.assertIn("clear\natom_modify        map yes\nread_data second.lmp", result)
+
+    def test_map_inserted_before_create_box(self):
+        result = self.transform("region box block 0 1 0 1 0 1\ncreate_box 1 box\n")
+        self.assertLess(result.index("atom_modify"), result.index("create_box"))
+
+    def test_explicit_map_styles_are_preserved(self):
+        for map_style in ("array", "hash"):
+            with self.subTest(map_style=map_style):
+                lines = f"atom_modify map {map_style}\nread_data conf.lmp\n"
+                self.assertEqual(self.transform(lines), lines)
+
+    def test_map_after_read_raises(self):
+        self.input_path.write_text("read_data conf.lmp\natom_modify map yes\n")
+        with self.assertRaisesRegex(RuntimeError, "atom_modify map before"):
+            ensure_pt2_atom_map(str(self.input_path))
+
+    def test_no_read_command_raises(self):
+        self.input_path.write_text("atom_modify map yes\npair_style deepmd\n")
+        with self.assertRaisesRegex(RuntimeError, "create_box, read_data"):
+            ensure_pt2_atom_map(str(self.input_path))
+
+
+class TestModelExportFailure(unittest.TestCase):
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_freeze_failure_raises(self, mocked_run):
+        mocked_run.return_value = (1, "", "freeze error")
+        with self.assertRaisesRegex(FatalError, "freeze failed"):
+            freeze_model("input.pt", "output.pth", "pytorch")
+
+    @patch("dpgen2.op.run_lmp.run_command")
+    def test_compress_failure_raises(self, mocked_run):
+        mocked_run.return_value = (1, "", "compress error")
+        with self.assertRaisesRegex(FatalError, "compress failed"):
+            compress_model("input.pt2", "output.pt2", "pytorch-exportable")
