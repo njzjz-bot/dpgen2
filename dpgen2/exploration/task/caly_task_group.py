@@ -115,6 +115,18 @@ class CalyTaskGroup(ExplorationTaskGroup):
         self.numb_of_species = numb_of_species
         self.numb_of_atoms = numb_of_atoms
 
+        if numb_of_species != len(name_of_atoms):
+            raise ValueError(
+                f"numb_of_species={numb_of_species} does not match "
+                f"name_of_atoms={name_of_atoms!r}"
+            )
+        for atoms in name_of_atoms:
+            for atom in atoms if isinstance(atoms, list) else [atoms]:
+                if atom not in atomic_number_map or atom == "X":
+                    raise ValueError(
+                        f"unknown element {atom!r} in name_of_atoms={name_of_atoms!r}"
+                    )
+
         if isinstance(name_of_atoms, list) and all(
             [isinstance(i, list) for i in name_of_atoms]
         ):
@@ -154,9 +166,22 @@ class CalyTaskGroup(ExplorationTaskGroup):
             # Generate a complete distance matrix from the maintained
             # covalent-radius table when the optional matrix is omitted.
             updated_table = copy.deepcopy(covalent_radii)
-            if isinstance(distance_of_ions, dict):
-                for key, value in distance_of_ions.items():
-                    updated_table[atomic_number_map[key]] = value
+            overrides = distance_of_ions if isinstance(distance_of_ions, dict) else {}
+            for key, value in overrides.items():
+                if key not in atomic_number_map or key == "X":
+                    raise ValueError(
+                        f"unknown element {key!r} in distance_of_ions overrides"
+                    )
+                updated_table[atomic_number_map[key]] = value
+            for atom in self.name_of_atoms:
+                if (
+                    covalent_radii[atomic_number_map[atom]] == UNKN
+                    and atom not in overrides
+                ):
+                    raise ValueError(
+                        f"no known covalent radius for {atom!r}; provide an explicit "
+                        "distance_of_ions matrix or a radius override for this element"
+                    )
 
             temp_distance_mtx = np.zeros((numb_of_species, numb_of_species))
             for i in range(numb_of_species):
