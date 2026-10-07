@@ -15,6 +15,9 @@ from typing import (
 
 import dpdata
 import numpy as np
+from dflow.python import (
+    FatalError,
+)
 from dflow.python.opio import (
     HDF5Dataset,
 )
@@ -60,17 +63,17 @@ class TrajRenderLammps(TrajRender):
 
     def _load_one_model_devi(self, fname, model_devi):
         if isinstance(fname, HDF5Dataset):
-            dd = fname.get_data()
+            dd = np.asarray(fname.get_data())
         else:
             dd = np.loadtxt(fname)
-        if (
-            len(np.shape(dd)) == 1  # type: ignore
-        ):  # In case model-devi.out is 1-dimensional
-            dd = dd.reshape((1, len(dd)))  # type: ignore
+        if dd.ndim == 1:  # In case model-devi.out is 1-dimensional
+            dd = dd.reshape((1, len(dd)))
 
         # A NaN or infinity would otherwise reach the report and scheduler, where
         # comparisons silently produce invalid trust levels. Fail at the artifact
         # boundary so users can inspect the corresponding LAMMPS task directly.
+        # Validate all six quantities exported by this loader, including virials
+        # that may be used by reports with virial trust levels configured.
         deviation_names = (
             DeviManager.MAX_DEVI_V,
             DeviManager.MIN_DEVI_V,
@@ -82,20 +85,24 @@ class TrajRenderLammps(TrajRender):
         invalid = np.argwhere(~np.isfinite(dd[:, 1:7]))
         if invalid.size:
             locations = ", ".join(
-                f"row {row + 1} ({deviation_names[column]})" for row, column in invalid
+                f"row {row + 1} ({deviation_names[column]})"
+                for row, column in invalid[:10].tolist()
             )
-            raise ValueError(
-                f"Non-finite model-deviation value in {fname}: {locations}. "
+            if len(invalid) > 10:
+                locations += f", ... ({len(invalid)} non-finite values in total)"
+            source = fname.key if isinstance(fname, HDF5Dataset) else fname
+            raise FatalError(
+                f"Non-finite model-deviation value in {source}: {locations}. "
                 "Inspect the LAMMPS/DeePMD task output before scheduling the "
                 "next exploration iteration."
             )
 
-        model_devi.add(DeviManager.MAX_DEVI_V, dd[:, 1])  # type: ignore
-        model_devi.add(DeviManager.MIN_DEVI_V, dd[:, 2])  # type: ignore
-        model_devi.add(DeviManager.AVG_DEVI_V, dd[:, 3])  # type: ignore
-        model_devi.add(DeviManager.MAX_DEVI_F, dd[:, 4])  # type: ignore
-        model_devi.add(DeviManager.MIN_DEVI_F, dd[:, 5])  # type: ignore
-        model_devi.add(DeviManager.AVG_DEVI_F, dd[:, 6])  # type: ignore
+        model_devi.add(DeviManager.MAX_DEVI_V, dd[:, 1])
+        model_devi.add(DeviManager.MIN_DEVI_V, dd[:, 2])
+        model_devi.add(DeviManager.AVG_DEVI_V, dd[:, 3])
+        model_devi.add(DeviManager.MAX_DEVI_F, dd[:, 4])
+        model_devi.add(DeviManager.MIN_DEVI_F, dd[:, 5])
+        model_devi.add(DeviManager.AVG_DEVI_F, dd[:, 6])
 
     def get_ele_temp(self, optional_outputs):
         ele_temp = []
