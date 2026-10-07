@@ -61,7 +61,10 @@ def _make_train_command(
     # find checkpoint
     if impl == "tensorflow" and os.path.isfile("checkpoint"):
         checkpoint = "model.ckpt"
-    elif impl == "pytorch" and len(glob.glob("model.ckpt-[0-9]*.pt")) > 0:
+    elif (
+        impl in ["pytorch", "pytorch-exportable"]
+        and len(glob.glob("model.ckpt-[0-9]*.pt")) > 0
+    ):
         checkpoint = "model.ckpt-%s.pt" % max(
             [int(f[11:-3]) for f in glob.glob("model.ckpt-[0-9]*.pt")]
         )
@@ -184,10 +187,14 @@ class RunDPTrain(OP):
         finetune_mode = ip["optional_parameter"]["finetune_mode"]
         config = ip["config"] if ip["config"] is not None else {}
         impl = ip["config"].get("impl", "tensorflow")
+        if impl == "pt-expt":
+            impl = "pytorch-exportable"
         dp_command = ip["config"].get("command", "dp").split()
-        assert impl in ["tensorflow", "pytorch"]
+        assert impl in ["tensorflow", "pytorch", "pytorch-exportable"]
         if impl == "pytorch":
             dp_command.append("--pt")
+        elif impl == "pytorch-exportable":
+            dp_command.append("--pt-expt")
         finetune_args = config.get("finetune_args", "")
         train_args = config.get("train_args", "")
         config = RunDPTrain.normalize_config(config)
@@ -206,6 +213,18 @@ class RunDPTrain(OP):
             iter_data_new_exp = train_systems
             valid_data = append_valid_data(config, valid_data, valid_systems)
         iter_data_exp = iter_data_old_exp + iter_data_new_exp
+        if isinstance(init_data, dict):
+            if config["multitask"]:
+                has_init_training_data = len(init_data.get(config["head"], [])) > 0
+            else:
+                has_init_training_data = any(
+                    len(systems) > 0 for systems in init_data.values()
+                )
+        else:
+            has_init_training_data = len(init_data) > 0
+        # Initial data is expanded when the workflow is submitted, while a
+        # non-empty iteration artifact list may expand to zero systems here.
+        training_systems_empty = not has_init_training_data and len(iter_data_exp) == 0
         work_dir = Path(task_name)
         init_model_with_finetune = config["init_model_with_finetune"]
 
@@ -231,7 +250,7 @@ class RunDPTrain(OP):
             old_ratio = config["init_model_old_ratio"]
             if config["multitask"]:
                 head = config["head"]
-                len_init = len(init_data[head])
+                len_init = len(init_data.get(head, []))
             else:
                 len_init = len(init_data)
             numb_old = len_init + len(iter_data_old_exp)
@@ -269,7 +288,12 @@ class RunDPTrain(OP):
         )
 
         if RunDPTrain.skip_training(
-            work_dir, train_dict, init_model, iter_data, finetune_mode
+            work_dir,
+            train_dict,
+            init_model,
+            iter_data,
+            finetune_mode,
+            training_systems_empty=training_systems_empty,
         ):
             return OPIO(
                 {
@@ -334,7 +358,7 @@ class RunDPTrain(OP):
                 shutil.copy2("input_v2_compat.json", train_script_name)
 
             # freeze model
-            if impl == "pytorch":
+            if impl in ["pytorch", "pytorch-exportable"]:
                 model_file = "model.ckpt.pt"
             else:
                 ret, out, err = run_command(["dp", "freeze", "-o", "frozen_model.pb"])
@@ -355,10 +379,10 @@ class RunDPTrain(OP):
                     )
                     raise FatalError("dp freeze failed")
                 model_file = "frozen_model.pb"
-            fplog.write("#=================== freeze std out ===================\n")
-            fplog.write(out)
-            fplog.write("#=================== freeze std err ===================\n")
-            fplog.write(err)
+                fplog.write("#=================== freeze std out ===================\n")
+                fplog.write(out)
+                fplog.write("#=================== freeze std err ===================\n")
+                fplog.write(err)
 
             clean_before_quit()
 
@@ -462,18 +486,26 @@ class RunDPTrain(OP):
         init_model,
         iter_data,
         finetune_mode,
+        training_systems_empty=False,
     ):
         # do not skip if we do finetuning
         if finetune_mode is not None and finetune_mode == "finetune":
             return False
-        # we have init model and no iter data, skip training
-        if (init_model is not None) and (iter_data is None or len(iter_data) == 0):
+        # Reuse the supplied model when there is no new iteration data or when
+        # all configured inputs expand to zero actual training systems.
+        no_iter_data = iter_data is None or len(iter_data) == 0
+        if (init_model is not None) and (no_iter_data or training_systems_empty):
             with set_directory(work_dir):
                 with open(train_script_name, "w") as fp:
                     json.dump(train_dict, fp, indent=4)
+                reason = (
+                    "no expanded training systems"
+                    if training_systems_empty
+                    else "no iteration training data"
+                )
                 Path("train.log").write_text(
                     f"We have init model {init_model} and "
-                    f"no iteration training data. "
+                    f"{reason}. "
                     f"The training is skipped.\n"
                 )
                 Path("lcurve.out").touch()
@@ -519,7 +551,7 @@ class RunDPTrain(OP):
     @staticmethod
     def training_args():
         doc_command = "The command for DP, 'dp' for default"
-        doc_impl = "The implementation/backend of DP. It can be 'tensorflow' or 'pytorch'. 'tensorflow' for default."
+        doc_impl = "The implementation/backend of DP. It can be 'tensorflow', 'pytorch', or 'pytorch-exportable' (alias 'pt-expt'). 'tensorflow' for default."
         doc_init_model_policy = "The policy of init-model training. It can be\n\n\
     - 'no': No init-model training. Traing from scratch.\n\n\
     - 'yes': Do init-model training.\n\n\
