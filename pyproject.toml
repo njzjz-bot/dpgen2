@@ -27,6 +27,8 @@ dependencies = [
 	     'lbg',
 	     'packaging',
 	     'pyyaml',
+
+	     'jsonpickle',
 	     'fpop',
 	     'dpgui',
              'cp2kdata',

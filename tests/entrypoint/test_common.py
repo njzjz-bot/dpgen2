@@ -52,3 +52,16 @@ explore:
 
             with self.assertRaisesRegex(ValueError, "root must be a mapping"):
                 load_config(path)
+
+    def test_yaml_scalar_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.yml"
+            path.write_text(
+                'threshold: 1.0e-8\ninteger: 4\nambiguous: 1e-8\ntype_map: ["No", "H"]\n'
+            )
+            config = load_config(path)
+            self.assertEqual(config["threshold"], 1.0e-8)
+            self.assertIsInstance(config["threshold"], float)
+            self.assertEqual(config["integer"], 4)
+            self.assertEqual(config["ambiguous"], "1e-8")
+            self.assertEqual(config["type_map"], ["No", "H"])

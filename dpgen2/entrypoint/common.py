@@ -25,7 +25,7 @@ from dpgen2.utils import (
 from dpgen2.utils.step_config import normalize as normalize_step_dict
 
 
-def load_config(path: Union[str, Path]) -> Dict:
+def load_config(path: Union[str, Path]) -> dict:
     r"""Load a DPGEN2 workflow configuration from JSON or YAML.
 
     YAML is selected for ``.yaml`` and ``.yml`` files. Other suffixes retain
