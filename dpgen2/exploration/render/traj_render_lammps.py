@@ -85,8 +85,9 @@ class TrajRenderLammps(TrajRender):
         invalid = np.argwhere(~np.isfinite(dd[:, 1:7]))
         if invalid.size:
             locations = ", ".join(
-                f"row {row + 1} ({deviation_names[column]})"
-                for row, column in invalid[:10].tolist()
+                f"row {int(invalid[index, 0]) + 1} "
+                f"({deviation_names[int(invalid[index, 1])]})"
+                for index in range(min(len(invalid), 10))
             )
             if len(invalid) > 10:
                 locations += f", ... ({len(invalid)} non-finite values in total)"
